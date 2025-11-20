@@ -1,0 +1,17 @@
+[package]
+name = "sqlite_test_utils"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Test utilities for SQLite database testing"
+repository = "https://github.com/halzy/sqlite_test_utils"
+readme = "README.md"
+keywords = ["sqlite", "testing", "database"]
+categories = ["development-tools::testing", "database"]
+
+[dependencies]
+fastrand = "2"
+rusqlite = { version = "0.37", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
