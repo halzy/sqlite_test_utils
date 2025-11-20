@@ -8,6 +8,7 @@ repository = "https://github.com/halzy/sqlite_test_utils"
 readme = "README.md"
 keywords = ["sqlite", "testing", "database"]
 categories = ["development-tools::testing", "database"]
+authors = ["Benjamin Halsted <bhalsted@gmail.com>"]
 
 [dependencies]
 fastrand = "2"
