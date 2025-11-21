@@ -287,3 +287,87 @@ pub fn read_row<S: AsRef<str>>(
     )?;
     Ok(data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn new_test_conn() -> (Connection, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = Connection::open(&db_path).unwrap();
+        (conn, dir)
+    }
+
+    #[test]
+    fn test_update_test_db_modifies_data() {
+        let (conn, _dir) = new_test_conn();
+        init_test_db(&conn, "main", 42, 10, 5).unwrap();
+
+        let before = read_row(&conn, "main", 1).unwrap();
+        fastrand::seed(999);
+        update_test_db(&conn, "main", 1, 20).unwrap();
+        let after = read_row(&conn, "main", 1).unwrap();
+
+        assert_ne!(before, after, "update_test_db should modify the row data");
+    }
+
+    #[test]
+    fn test_set_journal_mode() {
+        let (conn, _dir) = new_test_conn();
+        conn.execute("CREATE TABLE dummy (id INTEGER)", []).unwrap();
+
+        set_journal_mode(&conn, "WAL", "main").unwrap();
+
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+
+        // Invalid mode should fail
+        let result = set_journal_mode(&conn, "INVALID", "main");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_row_returns_correct_data() {
+        let (conn, _dir) = new_test_conn();
+        conn.execute(
+            "CREATE TABLE main.notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO main.notes (text) VALUES ('test_value')", [])
+            .unwrap();
+
+        let text = read_row(&conn, "main", 1).unwrap();
+        assert_eq!(text, "test_value");
+    }
+
+    #[test]
+    fn test_insert_returns_correct_row_id() {
+        let (conn, _dir) = new_test_conn();
+        init_test_db(&conn, "main", 42, 100, 5).unwrap();
+
+        let id1 = insert_test_db(&conn, "main", 10).unwrap();
+        let id2 = insert_test_db(&conn, "main", 10).unwrap();
+
+        assert_eq!(id1, 101);
+        assert_eq!(id2, 102);
+    }
+
+    #[test]
+    fn test_create_note_uses_words_not_placeholder() {
+        let (conn, _dir) = new_test_conn();
+        init_test_db(&conn, "main", 42, 5, 10).unwrap();
+
+        for id in 1..=5 {
+            let text = read_row(&conn, "main", id).unwrap();
+            assert!(
+                !text.contains("xyzzy"),
+                "Note should not contain placeholder"
+            );
+        }
+    }
+}

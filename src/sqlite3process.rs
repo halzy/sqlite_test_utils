@@ -6,7 +6,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(test)]
+use mock_instant::global::Instant;
+#[cfg(not(test))]
+use std::time::Instant;
 
 /// Wrapper for controlling an interactive sqlite3 process.
 ///
@@ -35,7 +40,7 @@ pub struct Sqlite3Process {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
-    stderr: Option<ChildStderr>,
+    pub(crate) stderr: Option<ChildStderr>,
     db_path: PathBuf,
 }
 
@@ -168,6 +173,16 @@ impl Sqlite3Process {
     }
 }
 
+/// Checks if elapsed time has exceeded the timeout.
+fn is_timed_out(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed > timeout
+}
+
+/// Determines if an error message should be logged based on exit status and stderr.
+fn should_log_error(success: bool, stderr_empty: bool) -> bool {
+    !success && !stderr_empty
+}
+
 impl Drop for Sqlite3Process {
     fn drop(&mut self) {
         if let Some(ref mut stdin) = self.stdin {
@@ -188,14 +203,14 @@ impl Drop for Sqlite3Process {
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        if !status.success() && !stderr_output.is_empty() {
+                        if should_log_error(status.success(), stderr_output.is_empty()) {
                             eprintln!("sqlite3 process exited with error: {status}");
                             eprintln!("stderr: {stderr_output}");
                         }
                         return;
                     }
                     Ok(None) => {
-                        if start.elapsed() > timeout {
+                        if is_timed_out(start.elapsed(), timeout) {
                             eprintln!("sqlite3 process failed to exit within 60 seconds!");
                             eprintln!("Database path: {}", self.db_path.display());
                             let _ = child.kill();
@@ -208,6 +223,143 @@ impl Drop for Sqlite3Process {
                         let _ = child.kill();
                         return;
                     }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mock_instant::global::MockClock;
+    use std::sync::mpsc;
+    use tempfile::tempdir;
+
+    fn new_test_process() -> (Sqlite3Process, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let process = Sqlite3Process::new(&db_path).unwrap();
+        (process, dir)
+    }
+
+    #[test]
+    fn test_is_timed_out() {
+        let timeout = Duration::from_secs(60);
+
+        // Not timed out: before and exactly at timeout
+        assert!(!is_timed_out(Duration::from_secs(0), timeout));
+        assert!(!is_timed_out(Duration::from_secs(59), timeout));
+        assert!(!is_timed_out(Duration::from_secs(60), timeout));
+
+        // Timed out: just after timeout
+        assert!(is_timed_out(Duration::from_millis(60_001), timeout));
+        assert!(is_timed_out(Duration::from_secs(61), timeout));
+    }
+
+    #[test]
+    fn test_should_log_error() {
+        // All four combinations of (success, stderr_empty)
+        assert!(!should_log_error(true, true)); // success, no stderr
+        assert!(!should_log_error(true, false)); // success, has stderr
+        assert!(!should_log_error(false, true)); // failed, no stderr
+        assert!(should_log_error(false, false)); // failed with stderr - only case that logs
+    }
+
+    #[test]
+    fn test_enable_wal_mode() {
+        let (mut process, _dir) = new_test_process();
+        process.enable_wal_mode();
+
+        let output = process.execute("PRAGMA journal_mode;").unwrap();
+        assert!(
+            output.to_lowercase().contains("wal"),
+            "WAL mode should be enabled, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_disable_wal_checkpointing() {
+        let (mut process, _dir) = new_test_process();
+        process.enable_wal_mode();
+
+        let before: i32 = process
+            .execute("PRAGMA wal_autocheckpoint;")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            before > 0,
+            "Default autocheckpoint should be > 0, got: {before}"
+        );
+
+        process.disable_wal_checkpointing();
+
+        let after: i32 = process
+            .execute("PRAGMA wal_autocheckpoint;")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(after, 0, "Autocheckpoint should be 0 after disable");
+    }
+
+    #[test]
+    fn test_create_dummy_data() {
+        let (mut process, _dir) = new_test_process();
+        process.create_dummy_data();
+
+        let count: i32 = process
+            .execute("SELECT COUNT(*) FROM test;")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 999, "Should have 999 rows");
+
+        let output = process
+            .execute("SELECT value FROM test WHERE id = 1;")
+            .unwrap();
+        assert!(
+            output.contains("Hello, World! 1"),
+            "First row should have expected content, got: {output}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "sqlite3 process hung")]
+    fn test_drop_timeout_panics() {
+        let (tx, rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let (mut process, _dir) = new_test_process();
+            process.execute("SELECT 1;").unwrap();
+
+            // Take stdin and stderr to prevent drop from exiting normally
+            let _stdin = process.stdin.take();
+            let _stderr = process.stderr.take();
+
+            // Reset mock clock and advance past timeout in another thread
+            MockClock::set_time(Duration::from_secs(0));
+            let advance_handle = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                MockClock::advance(Duration::from_millis(60_001));
+            });
+
+            drop(process);
+            let _ = advance_handle.join();
+            tx.send(()).unwrap();
+        });
+
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(_) => panic!("Test completed without panic"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("Test timed out after 5 seconds");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Err(e) = handle.join() {
+                    std::panic::resume_unwind(e);
                 }
             }
         }
